@@ -4,6 +4,8 @@ use crate::app_config::AppType;
 use crate::cli::failover_policy::{ensure_auto_failover_queue_ready, inspect_auto_failover_gate};
 use crate::cli::ui::{create_table, highlight, info, success};
 use crate::database::FailoverQueueItem;
+use crate::daemon::{self, ipc::client};
+use crate::daemon::ipc::protocol::{Request, Response};
 use crate::error::AppError;
 use crate::proxy::types::ProxyTakeoverStatus;
 use crate::services::provider::ProviderSortUpdate;
@@ -46,6 +48,12 @@ pub enum FailoverCommand {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Show live circuit-breaker state for queued providers
+    Circuits,
+
+    /// Reset one provider's live circuit breaker without restarting the worker
+    Reset { id: String },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +74,75 @@ pub fn execute(cmd: FailoverCommand, app: Option<AppType>) -> Result<(), AppErro
         FailoverCommand::Remove { id } => remove_provider(app_type, &id),
         FailoverCommand::Move { id, direction } => move_provider(app_type, &id, direction),
         FailoverCommand::Clear { yes } => clear_queue(app_type, yes),
+        FailoverCommand::Circuits => list_circuits(app_type),
+        FailoverCommand::Reset { id } => reset_circuit(app_type, &id),
+    }
+}
+
+fn daemon_request(request: &Request) -> Result<Response, AppError> {
+    client::round_trip(&daemon::paths::socket_path(), request)
+        .map_err(|error| AppError::Message(format!("contact cc-switch daemon: {error}")))
+}
+
+fn list_circuits(app_type: AppType) -> Result<(), AppError> {
+    ensure_failover_supported(&app_type)?;
+    let state = get_state()?;
+    let queue = state.db.get_failover_queue(app_type.as_str())?;
+    println!("{}", highlight("Live circuit breakers"));
+    for item in queue {
+        let response = daemon_request(&Request::CircuitBreakerStatus {
+            app_type: app_type.as_str().to_string(),
+            provider_id: item.provider_id.clone(),
+        })?;
+        match response {
+            Response::CircuitBreaker { stats, .. } => match stats {
+                Some(stats) => println!(
+                    "{} ({}) state={} failures={} successes={} requests={} failed={}",
+                    item.provider_name,
+                    item.provider_id,
+                    stats.state,
+                    stats.consecutive_failures,
+                    stats.consecutive_successes,
+                    stats.total_requests,
+                    stats.failed_requests
+                ),
+                None => println!(
+                    "{} ({}) state=not_initialized",
+                    item.provider_name, item.provider_id
+                ),
+            },
+            Response::Error { message } => return Err(AppError::Message(message)),
+            other => {
+                return Err(AppError::Message(format!(
+                    "unexpected daemon response: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reset_circuit(app_type: AppType, provider_id: &str) -> Result<(), AppError> {
+    ensure_failover_supported(&app_type)?;
+    let state = get_state()?;
+    state
+        .db
+        .get_provider_by_id(provider_id, app_type.as_str())?;
+    match daemon_request(&Request::ResetProviderCircuitBreaker {
+        app_type: app_type.as_str().to_string(),
+        provider_id: provider_id.to_string(),
+    })? {
+        Response::Ok => {
+            println!(
+                "{}",
+                success(&format!("Reset live circuit breaker for {provider_id}."))
+            );
+            Ok(())
+        }
+        Response::Error { message } => Err(AppError::Message(message)),
+        other => Err(AppError::Message(format!(
+            "unexpected daemon response: {other:?}"
+        ))),
     }
 }
 

@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
@@ -36,6 +36,55 @@ pub async fn health_check() -> impl IntoResponse {
 
 pub async fn get_status(State(state): State<ProxyServerState>) -> impl IntoResponse {
     Json(state.snapshot_status().await)
+}
+
+async fn authorize_internal_request(state: &ProxyServerState, headers: &HeaderMap) -> bool {
+    let supplied = headers
+        .get("x-cc-switch-proxy-session-token")
+        .and_then(|value| value.to_str().ok());
+    let expected = state.status.read().await.managed_session_token.clone();
+    supplied.is_some() && supplied == expected.as_deref()
+}
+
+pub async fn get_circuit_breaker_status(
+    State(state): State<ProxyServerState>,
+    headers: HeaderMap,
+    Path((app_type, provider_id)): Path<(String, String)>,
+) -> Response {
+    if !authorize_internal_request(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let stats = state
+        .provider_router
+        .get_circuit_breaker_stats(&provider_id, &app_type)
+        .await;
+    Json(json!({
+        "provider_id": provider_id,
+        "stats": stats,
+    }))
+    .into_response()
+}
+
+pub async fn reset_circuit_breaker(
+    State(state): State<ProxyServerState>,
+    headers: HeaderMap,
+    Path((app_type, provider_id)): Path<(String, String)>,
+) -> Response {
+    if !authorize_internal_request(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    state
+        .provider_router
+        .reset_provider_breaker(&provider_id, &app_type)
+        .await;
+    log::info!(
+        "[failover] provider circuit reset app={} provider={}",
+        app_type,
+        provider_id
+    );
+    Json(json!({ "ok": true, "provider_id": provider_id })).into_response()
 }
 
 /// Return the active cc-switch-managed Codex model catalog.

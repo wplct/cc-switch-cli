@@ -63,6 +63,11 @@ impl ProviderRouter {
                 if breaker.is_available().await {
                     result.push(provider);
                 } else {
+                    log::info!(
+                        "[failover] skip provider app={} provider={} reason=circuit_open",
+                        app_type,
+                        provider.id
+                    );
                     circuit_open_count += 1;
                 }
             }
@@ -113,6 +118,17 @@ impl ProviderRouter {
         } else {
             breaker.record_failure(used_half_open_permit).await;
         }
+
+        let stats = breaker.get_stats().await;
+        log::info!(
+            "[failover] provider result app={} provider={} success={} circuit_state={} consecutive_failures={} consecutive_successes={}",
+            app_type,
+            provider_id,
+            success,
+            stats.state,
+            stats.consecutive_failures,
+            stats.consecutive_successes
+        );
 
         self.db
             .update_provider_health_with_threshold(

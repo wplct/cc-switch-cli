@@ -200,7 +200,6 @@ impl CircuitBreaker {
         *self.state.read().await
     }
 
-    #[allow(dead_code)]
     pub async fn get_stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
             state: *self.state.read().await,
@@ -280,7 +279,7 @@ impl CircuitBreaker {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CircuitBreakerStats {
     pub state: CircuitState,

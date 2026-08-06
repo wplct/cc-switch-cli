@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::proxy::circuit_breaker::CircuitBreakerStats;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
@@ -36,6 +38,16 @@ pub enum Request {
     /// daemon writes the desired switch only; app routes start through
     /// `EnsureWorker`.
     SetGlobalEnabled { enabled: bool },
+    /// Foreground asks the worker for one provider's live circuit state.
+    CircuitBreakerStatus {
+        app_type: String,
+        provider_id: String,
+    },
+    /// Foreground asks the worker to close one provider's live circuit.
+    ResetProviderCircuitBreaker {
+        app_type: String,
+        provider_id: String,
+    },
     /// Force the daemon to stop the worker (if any) and exit.
     Shutdown,
 }
@@ -65,6 +77,10 @@ pub enum Response {
     },
     Error {
         message: String,
+    },
+    CircuitBreaker {
+        provider_id: String,
+        stats: Option<CircuitBreakerStats>,
     },
 }
 
@@ -194,6 +210,18 @@ mod tests {
     fn set_global_enabled_roundtrips_both_polarities() {
         roundtrip_request(Request::SetGlobalEnabled { enabled: true });
         roundtrip_request(Request::SetGlobalEnabled { enabled: false });
+    }
+
+    #[test]
+    fn circuit_breaker_requests_roundtrip() {
+        roundtrip_request(Request::CircuitBreakerStatus {
+            app_type: "codex".to_string(),
+            provider_id: "primary".to_string(),
+        });
+        roundtrip_request(Request::ResetProviderCircuitBreaker {
+            app_type: "codex".to_string(),
+            provider_id: "primary".to_string(),
+        });
     }
 
     #[test]

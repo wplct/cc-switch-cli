@@ -855,6 +855,92 @@ impl Supervisor {
         })
     }
 
+    async fn handle_circuit_breaker_request(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+        reset: bool,
+    ) -> Response {
+        let Some(app) = parse_app_type(app_type) else {
+            return Response::Error {
+                message: format!("unsupported app type: {app_type}"),
+            };
+        };
+        let info = {
+            let inner = self.inner.lock().await;
+            inner.workers.get(&app).cloned()
+        };
+        let Some(info) = info else {
+            return Response::Error {
+                message: format!("no running worker for {app_type}"),
+            };
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("create worker client: {error}"),
+                };
+            }
+        };
+        let url = worker_circuit_url(&info.address, info.port, app_type, provider_id);
+        let request = if reset {
+            client.post(url)
+        } else {
+            client.get(url)
+        }
+        .header(
+            "x-cc-switch-proxy-session-token",
+            info.session_token.as_str(),
+        );
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("contact {app_type} worker: {error}"),
+                };
+            }
+        };
+        if !response.status().is_success() {
+            return Response::Error {
+                message: format!("{app_type} worker returned {}", response.status()),
+            };
+        }
+        if reset {
+            return Response::Ok;
+        }
+
+        let payload = match response.json::<serde_json::Value>().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("decode {app_type} circuit status: {error}"),
+                };
+            }
+        };
+        let stats = match payload.get("stats") {
+            Some(value) if !value.is_null() => {
+                match serde_json::from_value(value.clone()) {
+                    Ok(stats) => Some(stats),
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("decode {app_type} circuit stats: {error}"),
+                        };
+                    }
+                }
+            }
+            _ => None,
+        };
+        Response::CircuitBreaker {
+            provider_id: provider_id.to_string(),
+            stats,
+        }
+    }
+
     pub async fn shutdown(&self) {
         let _spawn_guard = self.spawn_lock.lock().await;
         let stop_plan = self.plan_stop_all_workers(true).await;
@@ -1120,6 +1206,20 @@ impl Handler for Supervisor {
                     .await
             }
             Request::SetGlobalEnabled { enabled } => self.handle_set_global_enabled(enabled).await,
+            Request::CircuitBreakerStatus {
+                app_type,
+                provider_id,
+            } => {
+                self.handle_circuit_breaker_request(&app_type, &provider_id, false)
+                    .await
+            }
+            Request::ResetProviderCircuitBreaker {
+                app_type,
+                provider_id,
+            } => {
+                self.handle_circuit_breaker_request(&app_type, &provider_id, true)
+                    .await
+            }
             Request::Shutdown => self.handle_shutdown().await,
         }
     }
@@ -1198,6 +1298,23 @@ fn is_process_alive_for_signal(pid: u32) -> bool {
 }
 
 fn worker_status_url(address: &str, port: u16) -> String {
+    worker_url(address, port, "/status")
+}
+
+fn worker_circuit_url(
+    address: &str,
+    port: u16,
+    app_type: &str,
+    provider_id: &str,
+) -> String {
+    worker_url(
+        address,
+        port,
+        &format!("/__cc_switch/circuit/{app_type}/{provider_id}"),
+    )
+}
+
+fn worker_url(address: &str, port: u16, path: &str) -> String {
     let connect_host = match address {
         "0.0.0.0" => "127.0.0.1".to_string(),
         "::" => "::1".to_string(),
@@ -1208,7 +1325,7 @@ fn worker_status_url(address: &str, port: u16) -> String {
     } else {
         connect_host
     };
-    format!("http://{connect_host}:{port}/status")
+    format!("http://{connect_host}:{port}{path}")
 }
 
 #[cfg(test)]
