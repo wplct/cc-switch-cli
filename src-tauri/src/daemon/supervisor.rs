@@ -810,6 +810,7 @@ impl Supervisor {
 
     async fn probe_worker_runtime_status(&self, info: &WorkerInfo) -> Option<WorkerRuntimeStatus> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_millis(500))
             .build()
             .ok()?;
@@ -877,6 +878,7 @@ impl Supervisor {
         };
 
         let client = match reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
         {

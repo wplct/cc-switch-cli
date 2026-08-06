@@ -342,7 +342,7 @@ impl ProxyServer {
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
             .route(
-                "/__cc_switch/circuit/{app_type}/{provider_id}",
+                "/__cc_switch/circuit/:app_type/:provider_id",
                 get(handlers::get_circuit_breaker_status).post(handlers::reset_circuit_breaker),
             )
             .route("/v1/messages", post(handlers::handle_messages))
