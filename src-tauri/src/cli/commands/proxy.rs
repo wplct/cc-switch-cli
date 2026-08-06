@@ -214,7 +214,10 @@ fn serve_proxy(
     // 这里把 log facade 落到独立文件，保证 failover 尝试日志实时可见。
     let worker_log_path = crate::daemon::paths::state_dir().join("cc-switch-worker.log");
     if let Err(err) = crate::daemon::logging::install(&worker_log_path, log::LevelFilter::Info) {
-        eprintln!("warn: install worker logger at {} failed: {err}", worker_log_path.display());
+        eprintln!(
+            "warn: install worker logger at {} failed: {err}",
+            worker_log_path.display()
+        );
     }
 
     let state = get_state()?;
