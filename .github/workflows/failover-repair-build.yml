@@ -47,6 +47,7 @@ jobs:
         run: |
           cargo test --lib circuit_breaker
           cargo test --lib daemon::ipc::protocol
+          cargo test --bin cc-switch uses_own_logger
 
       - name: Build release binary
         working-directory: src-tauri

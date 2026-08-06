@@ -36,6 +36,10 @@ fn command_uses_own_logger(command: &Option<Commands>) -> bool {
         Some(Commands::Daemon(cc_switch_lib::cli::commands::daemon::DaemonCommand::Start {
             ..
         })) => true,
+        // proxy serve 需要把 failover 日志落盘到独立文件，由 serve_proxy 自行安装文件 logger
+        Some(Commands::Proxy(cc_switch_lib::cli::commands::proxy::ProxyCommand::Serve { .. })) => {
+            true
+        }
         _ => false,
     }
 }
@@ -188,6 +192,13 @@ mod tests {
         let cli = Cli::parse_from(["cc-switch", "provider", "list"]);
 
         assert!(!command_uses_own_logger(&cli.command));
+    }
+
+    #[test]
+    fn proxy_serve_uses_own_logger() {
+        let cli = Cli::parse_from(["cc-switch", "proxy", "serve"]);
+
+        assert!(command_uses_own_logger(&cli.command));
     }
 
     #[test]
