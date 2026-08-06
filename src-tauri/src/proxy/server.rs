@@ -343,8 +343,7 @@ impl ProxyServer {
             .route("/status", get(handlers::get_status))
             .route(
                 "/__cc_switch/circuit/{app_type}/{provider_id}",
-                get(handlers::get_circuit_breaker_status)
-                    .post(handlers::reset_circuit_breaker),
+                get(handlers::get_circuit_breaker_status).post(handlers::reset_circuit_breaker),
             )
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))

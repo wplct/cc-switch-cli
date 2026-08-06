@@ -923,16 +923,14 @@ impl Supervisor {
             }
         };
         let stats = match payload.get("stats") {
-            Some(value) if !value.is_null() => {
-                match serde_json::from_value(value.clone()) {
-                    Ok(stats) => Some(stats),
-                    Err(error) => {
-                        return Response::Error {
-                            message: format!("decode {app_type} circuit stats: {error}"),
-                        };
-                    }
+            Some(value) if !value.is_null() => match serde_json::from_value(value.clone()) {
+                Ok(stats) => Some(stats),
+                Err(error) => {
+                    return Response::Error {
+                        message: format!("decode {app_type} circuit stats: {error}"),
+                    };
                 }
-            }
+            },
             _ => None,
         };
         Response::CircuitBreaker {
@@ -1301,12 +1299,7 @@ fn worker_status_url(address: &str, port: u16) -> String {
     worker_url(address, port, "/status")
 }
 
-fn worker_circuit_url(
-    address: &str,
-    port: u16,
-    app_type: &str,
-    provider_id: &str,
-) -> String {
+fn worker_circuit_url(address: &str, port: u16, app_type: &str, provider_id: &str) -> String {
     worker_url(
         address,
         port,
