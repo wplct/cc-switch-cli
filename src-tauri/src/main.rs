@@ -37,9 +37,9 @@ fn command_uses_own_logger(command: &Option<Commands>) -> bool {
             ..
         })) => true,
         // proxy serve 需要把 failover 日志落盘到独立文件，由 serve_proxy 自行安装文件 logger
-        Some(Commands::Proxy(cc_switch_lib::cli::commands::proxy::ProxyCommand::Serve { .. })) => {
-            true
-        }
+        Some(Commands::Proxy(cc_switch_lib::cli::commands::proxy::ProxyCommand::Serve {
+            ..
+        })) => true,
         _ => false,
     }
 }
