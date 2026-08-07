@@ -1941,9 +1941,7 @@ impl ProxyService {
                 .rollback_proxy_and_auto_failover_activation(&activation)
                 .await
             {
-                return Err(format!(
-                    "{stage_error}; rollback failed: {rollback_error}"
-                ));
+                return Err(format!("{stage_error}; rollback failed: {rollback_error}"));
             }
             return Err(stage_error);
         }
@@ -1993,13 +1991,9 @@ impl ProxyService {
                 .map_err(|error| {
                     format!("restore prior live backup for {app_key} failed: {error}")
                 })?,
-            None => self
-                .db
-                .delete_live_backup(app_key)
-                .await
-                .map_err(|error| {
-                    format!("delete temporary live backup for {app_key} failed: {error}")
-                })?,
+            None => self.db.delete_live_backup(app_key).await.map_err(|error| {
+                format!("delete temporary live backup for {app_key} failed: {error}")
+            })?,
         }
         self.restore_current_provider_after_activation_failure(activation)
     }

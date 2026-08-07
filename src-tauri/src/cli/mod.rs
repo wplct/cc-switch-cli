@@ -426,9 +426,9 @@ mod tests {
         let cli = Cli::parse_from(["cc-switch", "failover", "enable"]);
 
         match cli.command {
-            Some(Commands::Failover(
-                super::commands::failover::FailoverCommand::Enable { yes },
-            )) => assert!(!yes),
+            Some(Commands::Failover(super::commands::failover::FailoverCommand::Enable {
+                yes,
+            })) => assert!(!yes),
             _ => panic!("expected failover enable command"),
         }
     }
@@ -438,9 +438,9 @@ mod tests {
         let cli = Cli::parse_from(["cc-switch", "failover", "enable", "--yes"]);
 
         match cli.command {
-            Some(Commands::Failover(
-                super::commands::failover::FailoverCommand::Enable { yes },
-            )) => assert!(yes),
+            Some(Commands::Failover(super::commands::failover::FailoverCommand::Enable {
+                yes,
+            })) => assert!(yes),
             _ => panic!("expected failover enable --yes command"),
         }
     }
