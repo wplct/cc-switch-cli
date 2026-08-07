@@ -48,7 +48,9 @@ jobs:
           cargo test --lib circuit_breaker
           cargo test --lib daemon::ipc::protocol
           cargo test --bin cc-switch uses_own_logger
-          cargo test --lib codex_failover_queue_does_not_sync_live_token_to_current_provider -- --exact --nocapture
+          cargo test --lib codex_failover_queue_does_not_sync_live_token_to_current_provider -- --nocapture
+          cargo test --lib enabling_codex_takeover_syncs_live_token_back_to_current_provider -- --nocapture
+          cargo test --lib cached_failover_snapshot_applies_current_unified_session_policy -- --nocapture
 
       - name: Build release binary
         working-directory: src-tauri

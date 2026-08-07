@@ -1568,7 +1568,8 @@ impl ProxyService {
             return Ok(existing);
         }
 
-        let (live, sync_live_token_to_current, _) = self
+        // 自动故障转移的 live 配置没有可靠的供应商归属，凭证只能来自 provider 配置。
+        let (live, _, _) = self
             .read_takeover_source_live(app_type, fallback_provider_id)
             .await?;
         let backup = serde_json::to_string(&live)
@@ -1577,14 +1578,11 @@ impl ProxyService {
             .save_live_backup(app_key, &backup)
             .await
             .map_err(|error| format!("save {app_key} live backup failed: {error}"))?;
-        if sync_live_token_to_current {
-            self.sync_live_config_to_current_provider(app_type, &live)
-                .await?;
-        }
 
         Ok(live)
     }
 
+    /// 使用目标 provider 的凭证构建故障转移快照，并仅继承 live 中的非凭证配置。
     fn build_failover_live_snapshot(
         &self,
         app_type: &AppType,
@@ -1593,13 +1591,48 @@ impl ProxyService {
     ) -> Result<Value, String> {
         let provider_snapshot = self.build_live_snapshot_from_provider(app_type, provider)?;
         if matches!(app_type, AppType::Codex) {
-            return Self::prepare_codex_backup_from_existing(
+            let provider_api_key = provider_snapshot
+                .pointer("/auth/OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mut snapshot = Self::prepare_codex_backup_from_existing(
                 provider,
                 provider_snapshot,
                 Some(original_live),
+            )?;
+            Self::apply_codex_provider_api_key_to_failover_snapshot(
+                &mut snapshot,
+                provider_api_key,
             );
+            return Ok(snapshot);
         }
         Self::merge_live_backup_snapshot(app_type, Some(original_live), None, provider_snapshot)
+    }
+
+    /// 保留 Codex OAuth 登录材料，同时确保 API key 只来自目标 provider。
+    fn apply_codex_provider_api_key_to_failover_snapshot(
+        snapshot: &mut Value,
+        provider_api_key: Option<String>,
+    ) {
+        if let Some(provider_api_key) = provider_api_key {
+            let Some(snapshot_obj) = snapshot.as_object_mut() else {
+                return;
+            };
+            let auth = snapshot_obj
+                .entry("auth".to_string())
+                .or_insert_with(|| json!({}));
+            if !auth.is_object() {
+                *auth = json!({});
+            }
+            if let Some(auth_obj) = auth.as_object_mut() {
+                auth_obj.insert("OPENAI_API_KEY".to_string(), json!(provider_api_key));
+            }
+            return;
+        }
+
+        if let Some(auth_obj) = snapshot.get_mut("auth").and_then(Value::as_object_mut) {
+            auth_obj.remove("OPENAI_API_KEY");
+        }
     }
 
     async fn save_failover_live_snapshot(
@@ -1676,6 +1709,15 @@ impl ProxyService {
                     provider,
                     &mut cached,
                 )?;
+                let provider_api_key = self
+                    .build_live_snapshot_from_provider(app_type, provider)?
+                    .pointer("/auth/OPENAI_API_KEY")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Self::apply_codex_provider_api_key_to_failover_snapshot(
+                    &mut cached,
+                    provider_api_key,
+                );
                 if cached != original {
                     self.save_failover_live_snapshot(app_type, &provider.id, &cached)
                         .await?;
@@ -2911,14 +2953,8 @@ impl ProxyService {
             .get_proxy_config_for_app(app_key)
             .await
             .map_err(|error| format!("load proxy config for {app_key} failed: {error}"))?;
-        let failover_provider_count = self
-            .db
-            .get_failover_queue(app_key)
-            .map_err(|error| format!("load failover queue for {app_key} failed: {error}"))?
-            .len();
-
-        // 多供应商场景下 live 配置不具备可靠的供应商归属，禁止用它反向覆盖凭证。
-        if app_proxy.auto_failover_enabled || failover_provider_count > 1 {
+        // 自动故障转移场景下 live 配置不具备可靠的供应商归属，禁止用它反向覆盖凭证。
+        if app_proxy.auto_failover_enabled {
             log::info!(
                 "skip syncing {app_key} live token because automatic failover credentials are provider-scoped"
             );
@@ -5680,6 +5716,27 @@ mod tests {
     async fn codex_failover_queue_does_not_sync_live_token_to_current_provider() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = TestHomeEnvGuard::set(temp_home.path());
+        std::fs::create_dir_all(
+            get_codex_auth_path()
+                .parent()
+                .expect("codex auth parent dir"),
+        )
+        .expect("create ~/.codex");
+        write_json_file(
+            &get_codex_auth_path(),
+            &json!({"OPENAI_API_KEY": "ciii-key"}),
+        )
+        .expect("seed Ciii live auth");
+        write_text_file(
+            &get_codex_config_path(),
+            r#"model_provider = "ciii"
+
+[model_providers.ciii]
+base_url = "https://ciii.example/v1"
+"#,
+        )
+        .expect("seed Ciii live config");
+
         let db = Arc::new(Database::memory().expect("create database"));
         let service = ProxyService::new(db.clone());
         let ciii = Provider::with_id(
@@ -5687,7 +5744,11 @@ mod tests {
             "Ciii".to_string(),
             json!({
                 "auth": {"OPENAI_API_KEY": "ciii-key"},
-                "config": "model_provider = \"ciii\""
+                "config": r#"model_provider = "ciii"
+
+[model_providers.ciii]
+base_url = "https://ciii.example/v1"
+"#
             }),
             None,
         );
@@ -5696,14 +5757,34 @@ mod tests {
             "ylscode".to_string(),
             json!({
                 "auth": {"OPENAI_API_KEY": "ylscode-key"},
-                "config": "model_provider = \"ylscode\""
+                "config": r#"model_provider = "ylscode"
+
+[model_providers.ylscode]
+base_url = "https://ylscode.example/v1"
+"#
             }),
             None,
         );
+        let mut official = Provider::with_id(
+            "official".to_string(),
+            "Official".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "official-key"},
+                "config": r#"model_provider = "official"
+
+[model_providers.official]
+base_url = "https://api.openai.com/v1"
+"#
+            }),
+            None,
+        );
+        official.category = Some("official".to_string());
         db.save_provider("codex", &ciii)
             .expect("save Ciii provider");
         db.save_provider("codex", &ylscode)
             .expect("save ylscode provider");
+        db.save_provider("codex", &official)
+            .expect("save official provider");
         db.set_current_provider("codex", &ylscode.id)
             .expect("set ylscode current provider");
         crate::settings::set_current_provider(&AppType::Codex, Some(&ylscode.id))
@@ -5712,6 +5793,13 @@ mod tests {
             .expect("queue Ciii provider");
         db.add_to_failover_queue("codex", &ylscode.id)
             .expect("queue ylscode provider");
+        db.add_to_failover_queue("codex", &official.id)
+            .expect("queue official provider");
+
+        service
+            .regenerate_failover_live_snapshots_for_app(&AppType::Codex, Some(&ciii.id))
+            .await
+            .expect("generate provider-scoped failover snapshots");
         db.set_proxy_flags_sync("codex", true, true)
             .expect("enable codex automatic failover");
 
@@ -5723,7 +5811,11 @@ mod tests {
             .await
             .expect("skip ambiguous live token sync");
 
-        for (provider_id, expected_key) in [("ciii", "ciii-key"), ("ylscode", "ylscode-key")] {
+        for (provider_id, expected_key) in [
+            ("ciii", "ciii-key"),
+            ("ylscode", "ylscode-key"),
+            ("official", "official-key"),
+        ] {
             let unchanged = db
                 .get_provider_by_id(provider_id, "codex")
                 .expect("read Codex provider")
@@ -5731,6 +5823,20 @@ mod tests {
             assert_eq!(
                 unchanged
                     .settings_config
+                    .pointer("/auth/OPENAI_API_KEY")
+                    .and_then(Value::as_str),
+                Some(expected_key)
+            );
+
+            let stored_snapshot = db
+                .get_failover_live_snapshot("codex", provider_id)
+                .await
+                .expect("read Codex failover snapshot")
+                .expect("Codex failover snapshot exists");
+            let snapshot: Value = serde_json::from_str(&stored_snapshot.config_json)
+                .expect("parse Codex failover snapshot");
+            assert_eq!(
+                snapshot
                     .pointer("/auth/OPENAI_API_KEY")
                     .and_then(Value::as_str),
                 Some(expected_key)
@@ -5789,6 +5895,27 @@ base_url = "https://api.openai.com/v1"
             .expect("save codex provider");
         db.set_current_provider("codex", &provider.id)
             .expect("set current codex provider");
+        let queued_provider = Provider::with_id(
+            "queued-codex-provider".to_string(),
+            "Queued Codex Provider".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "queued-provider-token"
+                },
+                "config": r#"model_provider = "queued"
+
+[model_providers.queued]
+base_url = "https://queued.example/v1"
+"#
+            }),
+            None,
+        );
+        db.save_provider("codex", &queued_provider)
+            .expect("save queued codex provider");
+        db.add_to_failover_queue("codex", &provider.id)
+            .expect("queue current codex provider");
+        db.add_to_failover_queue("codex", &queued_provider.id)
+            .expect("queue secondary codex provider");
 
         use_ephemeral_app_proxy_port(db.as_ref(), "codex");
 
@@ -7019,7 +7146,8 @@ base_url = "https://new.example/v1"
         let original_live = json!({
             "auth": {
                 "auth_mode": "chatgpt",
-                "tokens": { "access_token": "official-oauth-token" }
+                "tokens": { "access_token": "official-oauth-token" },
+                "OPENAI_API_KEY": "foreign-live-key"
             },
             "config": stale_config
         });
@@ -7034,6 +7162,16 @@ base_url = "https://new.example/v1"
         assert!(!config.contains("model_provider = \"custom\""));
         assert!(!config.contains("[model_providers.custom]"));
         assert!(config.contains("[mcp_servers.echo]"));
+        assert_eq!(
+            snapshot
+                .pointer("/auth/tokens/access_token")
+                .and_then(Value::as_str),
+            Some("official-oauth-token")
+        );
+        assert!(
+            snapshot.pointer("/auth/OPENAI_API_KEY").is_none(),
+            "official OAuth snapshot must not inherit a live API key"
+        );
     }
 
     #[tokio::test]
@@ -7059,7 +7197,10 @@ base_url = "https://new.example/v1"
         db.save_failover_live_snapshot(
             "codex",
             &provider.id,
-            &serde_json::to_string(&json!({ "auth": {}, "config": stale_config }))
+            &serde_json::to_string(&json!({
+                "auth": {"OPENAI_API_KEY": "foreign-live-key"},
+                "config": stale_config
+            }))
                 .expect("serialize stale snapshot"),
         )
         .await
@@ -7075,6 +7216,10 @@ base_url = "https://new.example/v1"
             .expect("normalized config");
         assert!(!config.contains("model_provider = \"custom\""));
         assert!(!config.contains("[model_providers.custom]"));
+        assert!(
+            normalized.pointer("/auth/OPENAI_API_KEY").is_none(),
+            "cached failover snapshot must drop a key absent from provider settings"
+        );
 
         let cached = db
             .get_failover_live_snapshot("codex", &provider.id)
@@ -7084,6 +7229,7 @@ base_url = "https://new.example/v1"
         assert!(!cached
             .config_json
             .contains("model_provider = \\\"custom\\\""));
+        assert!(!cached.config_json.contains("foreign-live-key"));
     }
 
     #[tokio::test]
