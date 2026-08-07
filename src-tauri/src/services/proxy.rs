@@ -5700,7 +5700,8 @@ mod tests {
             }),
             None,
         );
-        db.save_provider("codex", &ciii).expect("save Ciii provider");
+        db.save_provider("codex", &ciii)
+            .expect("save Ciii provider");
         db.save_provider("codex", &ylscode)
             .expect("save ylscode provider");
         db.set_current_provider("codex", &ylscode.id)
@@ -5722,9 +5723,7 @@ mod tests {
             .await
             .expect("skip ambiguous live token sync");
 
-        for (provider_id, expected_key) in
-            [("ciii", "ciii-key"), ("ylscode", "ylscode-key")]
-        {
+        for (provider_id, expected_key) in [("ciii", "ciii-key"), ("ylscode", "ylscode-key")] {
             let unchanged = db
                 .get_provider_by_id(provider_id, "codex")
                 .expect("read Codex provider")
