@@ -423,7 +423,13 @@ async fn test_stale_guard_does_not_release_new_half_open_generation() {
     let stale = router.acquire_provider_request("a", "claude").await;
     assert!(stale.allowed);
     router
-        .record_guarded_result(&stale, "a", "claude", false, Some("probe failed".to_string()))
+        .record_guarded_result(
+            &stale,
+            "a",
+            "claude",
+            false,
+            Some("probe failed".to_string()),
+        )
         .await
         .unwrap();
 
