@@ -2905,6 +2905,26 @@ impl ProxyService {
         app_type: &AppType,
         live_config: &Value,
     ) -> Result<(), String> {
+        let app_key = app_type.as_str();
+        let app_proxy = self
+            .db
+            .get_proxy_config_for_app(app_key)
+            .await
+            .map_err(|error| format!("load proxy config for {app_key} failed: {error}"))?;
+        let failover_provider_count = self
+            .db
+            .get_failover_queue(app_key)
+            .map_err(|error| format!("load failover queue for {app_key} failed: {error}"))?
+            .len();
+
+        // 多供应商场景下 live 配置不具备可靠的供应商归属，禁止用它反向覆盖凭证。
+        if app_proxy.auto_failover_enabled || failover_provider_count > 1 {
+            log::info!(
+                "skip syncing {app_key} live token because automatic failover credentials are provider-scoped"
+            );
+            return Ok(());
+        }
+
         enum LiveTokenSync {
             Claude(&'static str, String),
             Codex(String),
@@ -5652,6 +5672,71 @@ mod tests {
         );
         assert_env_str(live_env, "ANTHROPIC_API_KEY", Some(PROXY_TOKEN_PLACEHOLDER));
         assert_env_str(live_env, "ANTHROPIC_AUTH_TOKEN", None);
+    }
+
+    /// 验证多供应商故障转移不会把 live key 覆盖到当前 Codex provider。
+    #[tokio::test]
+    #[serial]
+    async fn codex_failover_queue_does_not_sync_live_token_to_current_provider() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestHomeEnvGuard::set(temp_home.path());
+        let db = Arc::new(Database::memory().expect("create database"));
+        let service = ProxyService::new(db.clone());
+        let ciii = Provider::with_id(
+            "ciii".to_string(),
+            "Ciii".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "ciii-key"},
+                "config": "model_provider = \"ciii\""
+            }),
+            None,
+        );
+        let ylscode = Provider::with_id(
+            "ylscode".to_string(),
+            "ylscode".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "ylscode-key"},
+                "config": "model_provider = \"ylscode\""
+            }),
+            None,
+        );
+        db.save_provider("codex", &ciii).expect("save Ciii provider");
+        db.save_provider("codex", &ylscode)
+            .expect("save ylscode provider");
+        db.set_current_provider("codex", &ylscode.id)
+            .expect("set ylscode current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&ylscode.id))
+            .expect("set effective current provider");
+        db.add_to_failover_queue("codex", &ciii.id)
+            .expect("queue Ciii provider");
+        db.add_to_failover_queue("codex", &ylscode.id)
+            .expect("queue ylscode provider");
+        db.set_proxy_flags_sync("codex", true, true)
+            .expect("enable codex automatic failover");
+
+        service
+            .sync_live_config_to_current_provider(
+                &AppType::Codex,
+                &json!({"auth": {"OPENAI_API_KEY": "ciii-key"}}),
+            )
+            .await
+            .expect("skip ambiguous live token sync");
+
+        for (provider_id, expected_key) in
+            [("ciii", "ciii-key"), ("ylscode", "ylscode-key")]
+        {
+            let unchanged = db
+                .get_provider_by_id(provider_id, "codex")
+                .expect("read Codex provider")
+                .expect("Codex provider exists");
+            assert_eq!(
+                unchanged
+                    .settings_config
+                    .pointer("/auth/OPENAI_API_KEY")
+                    .and_then(Value::as_str),
+                Some(expected_key)
+            );
+        }
     }
 
     #[tokio::test]
