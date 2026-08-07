@@ -51,6 +51,8 @@ jobs:
           cargo test --lib codex_failover_queue_does_not_sync_live_token_to_current_provider -- --nocapture
           cargo test --lib enabling_codex_takeover_syncs_live_token_back_to_current_provider -- --nocapture
           cargo test --lib cached_failover_snapshot_applies_current_unified_session_policy -- --nocapture
+          cargo test --lib parses_failover_enable -- --nocapture
+          cargo test --lib proxy_and_auto_failover -- --nocapture
 
       - name: Build release binary
         working-directory: src-tauri

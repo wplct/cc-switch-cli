@@ -1809,6 +1809,26 @@ impl ProxyService {
             .map_err(|error| format!("update proxy config for {app_type} failed: {error}"))
     }
 
+    /// 在启动 daemon worker 前暂存代理与自动故障转移状态，避免 live key 被按手动接管回写。
+    async fn persist_proxy_and_auto_failover_activation_for_app(
+        &self,
+        app_type: &str,
+    ) -> Result<(), String> {
+        let mut config = self
+            .db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .map_err(|error| format!("load proxy config for {app_type} failed: {error}"))?;
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        self.db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|error| {
+                format!("stage proxy and auto failover for {app_type} failed: {error}")
+            })
+    }
+
     pub async fn set_auto_failover_for_app(
         &self,
         app_type: &str,
@@ -1906,13 +1926,28 @@ impl ProxyService {
             .ok_or_else(|| format!("missing rollback backup for {app_key}"))?;
         self.switch_proxy_target(app_key, &first_provider_id)
             .await?;
-        Ok(AutoFailoverActivation {
+        let activation = AutoFailoverActivation {
             app_type,
             previous_db_current_provider,
             previous_local_current_provider,
             previous_live_backup,
             rollback_live_backup,
-        })
+        };
+        if let Err(stage_error) = self
+            .persist_proxy_and_auto_failover_activation_for_app(activation.app_type.as_str())
+            .await
+        {
+            if let Err(rollback_error) = self
+                .rollback_proxy_and_auto_failover_activation(&activation)
+                .await
+            {
+                return Err(format!(
+                    "{stage_error}; rollback failed: {rollback_error}"
+                ));
+            }
+            return Err(stage_error);
+        }
+        Ok(activation)
     }
 
     fn restore_current_provider_after_activation_failure(
@@ -1935,6 +1970,38 @@ impl ProxyService {
             activation.previous_local_current_provider.as_deref(),
         )
         .map_err(|error| format!("restore local current provider for {app_key} failed: {error}"))
+    }
+
+    /// 回滚组合启用已修改的 live、快照、路由状态和当前 provider。
+    async fn rollback_proxy_and_auto_failover_activation(
+        &self,
+        activation: &AutoFailoverActivation,
+    ) -> Result<(), String> {
+        let app_key = activation.app_type.as_str();
+        self.db
+            .save_live_backup(app_key, &activation.rollback_live_backup)
+            .await
+            .map_err(|error| format!("restore live backup for {app_key} failed: {error}"))?;
+        self.disable_takeover_for_app_unlocked(&activation.app_type, false)
+            .await?;
+
+        match activation.previous_live_backup.as_deref() {
+            Some(previous_live_backup) => self
+                .db
+                .save_live_backup(app_key, previous_live_backup)
+                .await
+                .map_err(|error| {
+                    format!("restore prior live backup for {app_key} failed: {error}")
+                })?,
+            None => self
+                .db
+                .delete_live_backup(app_key)
+                .await
+                .map_err(|error| {
+                    format!("delete temporary live backup for {app_key} failed: {error}")
+                })?,
+        }
+        self.restore_current_provider_after_activation_failure(activation)
     }
 
     fn clear_database_current_provider_for_app(&self, app_type: &str) -> Result<(), String> {
@@ -1961,50 +2028,19 @@ impl ProxyService {
         };
         let app_key = activation.app_type.as_str();
         if let Err(start_error) = self.set_managed_session_for_app(app_key, true).await {
-            {
+            let rollback_result = {
                 let _guard =
                     crate::services::state_coordination::acquire_restore_mutation_guard().await?;
-                self.db
-                    .save_live_backup(app_key, &activation.rollback_live_backup)
+                self.rollback_proxy_and_auto_failover_activation(&activation)
                     .await
-                    .map_err(|rollback_error| {
-                        format!(
-                            "enable proxy and auto failover failed: {start_error}; rollback failed: restore live backup for {app_key} failed: {rollback_error}"
-                        )
-                    })?;
-                if let Err(rollback_error) = self
-                    .disable_takeover_for_app_unlocked(&activation.app_type, false)
-                    .await
-                {
-                    return Err(format!(
-                        "enable proxy and auto failover failed: {start_error}; rollback failed: {rollback_error}"
-                    ));
-                }
-                let restore_backup_result = match activation.previous_live_backup.as_deref() {
-                    Some(previous_live_backup) => {
-                        self.db
-                            .save_live_backup(app_key, previous_live_backup)
-                            .await
-                    }
-                    None => self.db.delete_live_backup(app_key).await,
-                };
-                if let Err(rollback_error) = restore_backup_result {
-                    return Err(format!(
-                        "enable proxy and auto failover failed: {start_error}; rollback failed: restore prior live backup for {app_key} failed: {rollback_error}"
-                    ));
-                }
-                if let Err(rollback_error) =
-                    self.restore_current_provider_after_activation_failure(&activation)
-                {
-                    return Err(format!(
-                        "enable proxy and auto failover failed: {start_error}; rollback failed: {rollback_error}"
-                    ));
-                }
+            };
+            if let Err(rollback_error) = rollback_result {
+                return Err(format!(
+                    "enable proxy and auto failover failed: {start_error}; rollback failed: {rollback_error}"
+                ));
             }
             return Err(start_error);
         }
-        self.persist_auto_failover_for_app(app_key, true).await?;
-
         Ok(())
     }
 
@@ -5250,6 +5286,11 @@ mod tests {
                 .as_deref(),
             Some("queue-head")
         );
+        assert_eq!(
+            db.get_proxy_flags_sync("claude"),
+            (true, true),
+            "combined activation must stage failover state before starting the worker"
+        );
     }
 
     #[tokio::test]
@@ -7201,7 +7242,7 @@ base_url = "https://new.example/v1"
                 "auth": {"OPENAI_API_KEY": "foreign-live-key"},
                 "config": stale_config
             }))
-                .expect("serialize stale snapshot"),
+            .expect("serialize stale snapshot"),
         )
         .await
         .expect("seed stale snapshot");
